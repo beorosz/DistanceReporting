@@ -5,6 +5,10 @@
 #include "secrets.h"
 #include <AsyncMqttClient.h>
 
+#include "LittleFS.h"
+#define FORMAT_LITTLEFS_IF_FAILED true
+char gateOpenedStatusFileName[] = "/gatestatus.txt";
+
 // Copy secrets
 char wifi_ssid[] = WIFI_SSID;
 char wifi_password[] = WIFI_PASSWORD;
@@ -16,9 +20,15 @@ const int echoPin = 14;
 const int ledPin = 21;
 const int openClosePin = 23;
 
-bool isGateOpened;
 // Control flag for sending gate status once per change
 bool hasGateStatusChanged;
+// If MQTT connection is not available for 60000 milliseconds, restart the ESP
+const long MS_SINCE_MQTT_DISCONNECTED_THRESHOLD = 60000;
+long lastReportSendTime;
+
+// Timer frequencies
+const long DISTANCE_MEASURE_REPORT_TIMER_FREQUENCY = 10000;
+const long RECONNECT_TIMER_FREQUENCY = 2000;
 
 //define sound speed in cm/microSec (343 m/s)
 #define SOUND_SPEED 0.0343
@@ -118,6 +128,43 @@ void measureAndReportDistance()
   free(payload);
 }
 
+/************************************************/
+/*              File I/O handlers               */
+/************************************************/
+
+String readFileContent(const char *path)
+{
+  File file = LittleFS.open(path);
+  if (!file || file.isDirectory())
+  {
+    Serial.println("- failed to open file for reading");
+    return "";
+  }
+  String fileContent = file.readString();
+  file.close();
+
+  return fileContent;
+}
+
+bool writeFile(const char *path, const char *message)
+{
+  File file = LittleFS.open(path, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println("- failed to open file for writing");
+    return false;
+  }
+  if (!file.print(message))
+  {
+    Serial.println("- write failed");
+    return false;
+  }
+
+  file.close();
+
+  return true;
+}
+
 /************************************/
 /*             Setup                */
 /************************************/
@@ -129,17 +176,24 @@ void setup()
   pinMode(ledPin, OUTPUT);
   pinMode(openClosePin, INPUT_PULLUP);
 
-  // Read the current open/close status
-  isGateOpened = digitalRead(openClosePin) > 0 ? true : false;
+  LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED);
+  lastReportSendTime = millis();
 
-  // Send initial status in main loop
-  hasGateStatusChanged = true;  
+  // Read the current open/close status
+  String isGateOpened = digitalRead(openClosePin) > 0 ? "true" : "false";
+  String storedGateOpenedStatusInFile = readFileContent(gateOpenedStatusFileName);
+  Serial.printf("Stored gate opened status:%s\n", storedGateOpenedStatusInFile);
+  if (storedGateOpenedStatusInFile != isGateOpened)
+  {
+    hasGateStatusChanged = true;
+  }
+
   // Subscribe to pin value changes
   attachInterrupt(openClosePin, gateStatusChangedHandler, CHANGE);
 
-  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
-  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
-  distanceMeasureReportTimer = xTimerCreate("distanceMeasureReportTimer", pdMS_TO_TICKS(10000), pdTRUE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(measureAndReportDistance));
+  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(RECONNECT_TIMER_FREQUENCY), pdFALSE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(RECONNECT_TIMER_FREQUENCY), pdFALSE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
+  distanceMeasureReportTimer = xTimerCreate("distanceMeasureReportTimer", pdMS_TO_TICKS(DISTANCE_MEASURE_REPORT_TIMER_FREQUENCY), pdTRUE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(measureAndReportDistance));
 
   WiFi.onEvent(wiFiEventHandler);
 
@@ -163,19 +217,32 @@ void loop()
     delay(1000);
     digitalWrite(ledPin, LOW);
     delay(1000);
+
+    if (millis() - lastReportSendTime > MS_SINCE_MQTT_DISCONNECTED_THRESHOLD)
+    {
+      ESP.restart();
+    }
   }
-
-  // Publish gate status change message
-  else if (hasGateStatusChanged)
+  else
   {
-    isGateOpened = digitalRead(openClosePin) > 0 ? true : false;
-    Serial.println(isGateOpened ? "Gate is opening." : "Gate is closed.");
+    lastReportSendTime = millis();
 
-    size_t bufSize = snprintf(NULL, 0, "{ \"opened\": %s }", isGateOpened ? "true" : "false");
-    char *payload = (char *)malloc(bufSize + 1);
-    sprintf(payload, "{ \"opened\": %s }", isGateOpened ? "true" : "false");
-    mqttClient.publish("garage/gateStatus", 0, true, payload);
-    hasGateStatusChanged = false;
-    free(payload);
+    // Publish gate status change message
+    if (hasGateStatusChanged)
+    {
+      String isGateOpened = digitalRead(openClosePin) > 0 ? "true" : "false";
+      Serial.println(isGateOpened == "true" ? "Gate is opening." : "Gate is closed.");
+
+      writeFile(gateOpenedStatusFileName, isGateOpened.c_str());
+
+      size_t bufSize = snprintf(NULL, 0, "{ \"opened\": %s }", isGateOpened);
+      char *payload = (char *)malloc(bufSize + 1);
+      sprintf(payload, "{ \"opened\": %s }", isGateOpened);
+      mqttClient.publish("garage/gateStatus", 0, true, payload);
+      hasGateStatusChanged = false;
+      free(payload);
+    }
+
+    delay(1000);
   }
 }

@@ -1,0 +1,1 @@
+Windows executable included, releases for other architectures can be downloaded from https://github.com/earlephilhower/mklittlefs/releases/tag/3.0.0
